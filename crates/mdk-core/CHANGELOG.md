@@ -27,6 +27,12 @@
 
 ### Breaking changes
 
+- **Content Encoding**: Removed support for hex encoding in key package and welcome event content ([#98](https://github.com/marmot-protocol/mdk/pull/98))
+  - Key packages and welcome events now require explicit `["encoding", "base64"]` tag
+  - Events without encoding tags or with hex encoding are rejected
+  - This change addresses security concerns about encoding ambiguity and downgrade attacks
+  - Older key packages published without encoding tags are no longer supported
+  - Clients should republish key packages with proper encoding tags when upgrading
 - **BREAKING**: Changed `get_pending_welcomes()` to accept `Option<Pagination>` parameter for pagination support. Existing calls should pass `None` for default pagination. ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 - **MIP-02 Welcome Event Validation**: Encoding tag is now required for all welcome events ([#96](https://github.com/marmot-protocol/mdk/pull/96))
   - Welcome events must now include exactly 4 tags: `relays`, `e`, `client`, and `encoding`
@@ -59,9 +65,12 @@
 - **Security (Audit Issue G)**: Fixed admin authorization to read from current MLS group state instead of potentially stale stored metadata. The `is_leaf_node_admin` and `is_member_admin` functions now derive admin status from the `NostrGroupDataExtension` in the MLS group context, preventing a race window where a recently demoted admin could still perform privileged operations. ([#108](https://github.com/marmot-protocol/mdk/pull/108))
 - **Security (Audit Issue H)**: Added MIP-02 validation to prevent malformed welcome events from causing storage pollution and resource exhaustion ([#96](https://github.com/marmot-protocol/mdk/pull/96))
 - **Security (Audit Issue O)**: Missing Hash Verification in decrypt_group_image Allows Storage-Level Blob Substitution ([#97](https://github.com/marmot-protocol/mdk/pull/97))
+- **Security (Audit Issue R)**: Refactor encoding handling to enforce base64 usage for key packages and welcome ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 - **Security (Audit Issue AA)**: Added pagination to prevent memory exhaustion from unbounded loading of pending welcomes ([#110](https://github.com/marmot-protocol/mdk/pull/110))
 
 ### Removed
+
+- Removed all traces of hex encoding support for content fields in key packages and welcome events ([#98](https://github.com/marmot-protocol/mdk/pull/98))
 
 ### Deprecated
 
