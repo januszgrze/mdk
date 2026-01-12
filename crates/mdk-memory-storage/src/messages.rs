@@ -1,5 +1,6 @@
 //! Memory-based storage implementation of the MdkStorageProvider trait for Nostr MLS messages
 
+use mdk_storage_traits::GroupId;
 use std::collections::HashMap;
 
 use nostr::EventId;
@@ -8,8 +9,6 @@ use nostr::{Kind, PublicKey, Tags, Timestamp, UnsignedEvent};
 #[cfg(test)]
 use openmls_memory_storage::MemoryStorage;
 
-#[cfg(test)]
-use mdk_storage_traits::GroupId;
 use mdk_storage_traits::groups::GroupStorage;
 use mdk_storage_traits::messages::MessageStorage;
 use mdk_storage_traits::messages::error::MessageError;
@@ -62,10 +61,14 @@ impl MessageStorage for MdkMemoryStorage {
 
     fn find_message_by_event_id(
         &self,
+        mls_group_id: &GroupId,
         event_id: &EventId,
     ) -> Result<Option<Message>, MessageError> {
-        let cache = self.messages_cache.read();
-        Ok(cache.peek(event_id).cloned())
+        let group_cache = self.messages_by_group_cache.read();
+        match group_cache.peek(mls_group_id) {
+            Some(group_messages) => Ok(group_messages.get(event_id).cloned()),
+            None => Ok(None),
+        }
     }
 
     fn find_processed_message_by_event_id(
@@ -162,7 +165,7 @@ mod tests {
 
         // Verify initial message is saved
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.content, "Original content");
@@ -180,7 +183,7 @@ mod tests {
 
         // Verify the message was updated, not duplicated
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.content, "Updated content");
@@ -257,7 +260,7 @@ mod tests {
         // Verify messages are correctly associated with their groups
         let event_id_group1 = EventId::from_slice(&[0u8; 32]).unwrap();
         let found = storage
-            .find_message_by_event_id(&event_id_group1)
+            .find_message_by_event_id(&group1_id, &event_id_group1)
             .unwrap()
             .unwrap();
         assert_eq!(found.mls_group_id, group1_id);
@@ -265,7 +268,7 @@ mod tests {
 
         let event_id_group2 = EventId::from_slice(&[100u8; 32]).unwrap();
         let found = storage
-            .find_message_by_event_id(&event_id_group2)
+            .find_message_by_event_id(&group2_id, &event_id_group2)
             .unwrap()
             .unwrap();
         assert_eq!(found.mls_group_id, group2_id);
@@ -297,7 +300,7 @@ mod tests {
 
         // Verify only the final version exists
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.content, "Version 9");
@@ -333,7 +336,7 @@ mod tests {
 
         // Verify initial state
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.state, MessageState::Created);
@@ -345,7 +348,7 @@ mod tests {
 
         // Verify state was updated
         let found = storage
-            .find_message_by_event_id(&event_id)
+            .find_message_by_event_id(&group_id, &event_id)
             .unwrap()
             .unwrap();
         assert_eq!(found.state, MessageState::Processed);
