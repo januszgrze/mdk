@@ -240,16 +240,16 @@ impl GroupStorage for MdkMemoryStorage {
 
 #[cfg(test)]
 mod tests {
+    use mdk_storage_traits::groups::types::GroupState;
+    use mdk_storage_traits::messages::MessageStorage;
+    use mdk_storage_traits::messages::types::{Message, MessageState};
+    use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
+
     use super::*;
     use crate::{
         DEFAULT_MAX_ADMINS_PER_GROUP, DEFAULT_MAX_GROUP_DESCRIPTION_LENGTH,
         DEFAULT_MAX_GROUP_NAME_LENGTH, DEFAULT_MAX_RELAY_URL_LENGTH, DEFAULT_MAX_RELAYS_PER_GROUP,
     };
-    use mdk_storage_traits::groups::types::GroupState;
-    use mdk_storage_traits::messages::MessageStorage;
-    use mdk_storage_traits::messages::types::{Message, MessageState};
-    use nostr::{EventId, Keys, Kind, Tags, Timestamp, UnsignedEvent};
-    use openmls_memory_storage::MemoryStorage;
 
     fn create_test_group(mls_group_id: GroupId, nostr_group_id: [u8; 32]) -> Group {
         Group {
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_save_group_name_length_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         // Test with name at exactly the limit (should succeed)
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_save_group_description_length_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         // Test with description at exactly the limit (should succeed)
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_save_group_admin_count_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         // Test with admin count at exactly the limit (should succeed)
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_replace_group_relays_count_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         // Create a group first
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_replace_group_relays_url_length_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         // Create a group first
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_messages_pagination_memory() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         // Create a test group
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
@@ -573,7 +573,7 @@ mod tests {
             .with_max_admins_per_group(2)
             .with_max_relays_per_group(3);
 
-        let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
+        let storage = MdkMemoryStorage::with_limits(limits);
 
         // Verify limits are accessible
         assert_eq!(storage.limits().max_group_name_length, 10);
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_nostr_group_id_collision_rejected() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         // Create first group with a specific nostr_group_id
         let mls_group_id_1 = GroupId::from_slice(&[1, 2, 3, 4]);
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_nostr_group_id_update_removes_stale_entry() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let old_nostr_group_id = [1u8; 32];
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_same_group_update_allowed() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let nostr_group_id = [1u8; 32];

@@ -66,13 +66,12 @@
 #![warn(rustdoc::bare_urls)]
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use mdk_storage_traits::{Backend, MdkStorageProvider};
-use openmls_sqlite_storage::{Codec, SqliteStorageProvider};
+use mdk_storage_traits::{Backend, MdkStorageError, MdkStorageProvider};
+use openmls_traits::storage::{StorageProvider, traits};
 use rusqlite::Connection;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use tokio::sync::Mutex;
 
 mod db;
 pub mod encryption;
@@ -81,6 +80,7 @@ mod groups;
 pub mod keyring;
 mod messages;
 mod migrations;
+mod mls_storage;
 mod permissions;
 #[cfg(test)]
 mod test_utils;
@@ -89,40 +89,24 @@ mod welcomes;
 
 pub use self::encryption::EncryptionConfig;
 use self::error::Error;
+use self::mls_storage::{GroupDataType, STORAGE_PROVIDER_VERSION};
 pub use self::permissions::verify_permissions;
 use self::permissions::{
     FileCreationOutcome, precreate_secure_database_file, set_secure_file_permissions,
 };
 
-// Define a type alias for the specific SqliteStorageProvider we're using
-type MlsStorage = SqliteStorageProvider<JsonCodec, Connection>;
-
-// TODO: make this private?
-/// A codec for JSON serialization and deserialization.
-#[derive(Default)]
-pub struct JsonCodec;
-
-impl Codec for JsonCodec {
-    type Error = serde_json::Error;
-
-    #[inline]
-    fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Self::Error> {
-        serde_json::to_vec(value)
-    }
-
-    #[inline]
-    fn from_slice<T>(slice: &[u8]) -> Result<T, Self::Error>
-    where
-        T: DeserializeOwned,
-    {
-        serde_json::from_slice(slice)
-    }
-}
-
 /// A SQLite-based storage implementation for Nostr MLS.
 ///
 /// This struct implements the MdkStorageProvider trait for SQLite databases.
-/// It directly interfaces with a SQLite database for storing MLS data.
+/// It directly interfaces with a SQLite database for storing MLS data, using
+/// a single unified connection for both MLS cryptographic state and MDK-specific
+/// data (groups, messages, welcomes).
+///
+/// # Unified Storage Architecture
+///
+/// This implementation provides atomic transactions across all MLS and MDK state
+/// by using a single database connection. This enables proper rollback for
+/// commit race resolution as required by the Marmot Protocol.
 ///
 /// # Encryption
 ///
@@ -142,10 +126,8 @@ impl Codec for JsonCodec {
 /// )?;
 /// ```
 pub struct MdkSqliteStorage {
-    /// The OpenMLS storage implementation
-    openmls_storage: MlsStorage,
-    /// The SQLite connection
-    db_connection: Arc<Mutex<Connection>>,
+    /// The unified SQLite connection for both MLS and MDK state
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl MdkSqliteStorage {
@@ -357,27 +339,17 @@ impl MdkSqliteStorage {
         file_path: &Path,
         encryption_config: Option<EncryptionConfig>,
     ) -> Result<Self, Error> {
-        // Create or open the SQLite database for OpenMLS
-        let mls_connection = Self::open_connection(file_path, encryption_config.as_ref())?;
+        // Create or open the unified SQLite database connection
+        let mut connection = Self::open_connection(file_path, encryption_config.as_ref())?;
 
-        // Create OpenMLS storage
-        let mut openmls_storage: MlsStorage = SqliteStorageProvider::new(mls_connection);
-
-        // Initialize the OpenMLS storage
-        openmls_storage.run_migrations()?;
-
-        // Create a second connection for MDK tables
-        let mut mdk_connection = Self::open_connection(file_path, encryption_config.as_ref())?;
-
-        // Apply MDK migrations
-        migrations::run_migrations(&mut mdk_connection)?;
+        // Apply all migrations (both OpenMLS tables and MDK tables)
+        migrations::run_migrations(&mut connection)?;
 
         // Ensure secure permissions on the database file and any sidecar files
         Self::apply_secure_permissions(file_path)?;
 
         Ok(Self {
-            openmls_storage,
-            db_connection: Arc::new(Mutex::new(mdk_connection)),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 
@@ -462,39 +434,104 @@ impl MdkSqliteStorage {
     #[cfg(test)]
     pub fn new_in_memory() -> Result<Self, Error> {
         // Create an in-memory SQLite database
-        let mls_connection = Connection::open_in_memory()?;
+        let mut connection = Connection::open_in_memory()?;
 
         // Enable foreign keys
-        mls_connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
 
-        // Create OpenMLS storage
-        let mut openmls_storage: MlsStorage = SqliteStorageProvider::new(mls_connection);
-
-        // Initialize the OpenMLS storage
-        openmls_storage.run_migrations()?;
-
-        // For in-memory databases, we need to share the connection
-        // to keep the database alive, so we will clone the connection
-        // and let OpenMLS use a new handle
-        let mut mdk_connection: Connection = Connection::open_in_memory()?;
-
-        // Enable foreign keys
-        mdk_connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-
-        // Setup the schema in this connection as well
-        migrations::run_migrations(&mut mdk_connection)?;
+        // Run all migrations (both OpenMLS tables and MDK tables)
+        migrations::run_migrations(&mut connection)?;
 
         Ok(Self {
-            openmls_storage,
-            db_connection: Arc::new(Mutex::new(mdk_connection)),
+            connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    // ============================================================================
+    // Transaction and Savepoint Support
+    // ============================================================================
+
+    fn validate_savepoint_name(name: &str) -> Result<(), Error> {
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(Error::Database(
+                "Invalid savepoint name: must be non-empty and contain only alphanumeric characters and underscores".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Creates a savepoint with the given name.
+    ///
+    /// Savepoints allow nested transactions and the ability to rollback to a
+    /// specific point without rolling back the entire transaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the savepoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the savepoint cannot be created.
+    pub fn savepoint(&self, name: &str) -> Result<(), Error> {
+        Self::validate_savepoint_name(name)?;
+        let conn = self.connection.blocking_lock();
+        conn.execute(&format!("SAVEPOINT {}", name), [])
+            .map_err(|e| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Releases (commits) a savepoint.
+    ///
+    /// This commits all changes since the savepoint was created.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the savepoint to release.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the savepoint cannot be released.
+    pub fn release_savepoint(&self, name: &str) -> Result<(), Error> {
+        Self::validate_savepoint_name(name)?;
+        let conn = self.connection.blocking_lock();
+        conn.execute(&format!("RELEASE SAVEPOINT {}", name), [])
+            .map_err(|e| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Rolls back to a savepoint.
+    ///
+    /// This discards all changes made since the savepoint was created.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the savepoint to roll back to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rollback fails.
+    pub fn rollback_to_savepoint(&self, name: &str) -> Result<(), Error> {
+        Self::validate_savepoint_name(name)?;
+        let conn = self.connection.blocking_lock();
+        conn.execute(&format!("ROLLBACK TO SAVEPOINT {}", name), [])
+            .map_err(|e| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Provides access to the underlying connection for MDK storage operations.
+    ///
+    /// This method is for internal use by the group, message, and welcome storage implementations.
+    pub(crate) fn with_connection<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&Connection) -> T,
+    {
+        let conn = self.connection.blocking_lock();
+        f(&conn)
     }
 }
 
 /// Implementation of [`MdkStorageProvider`] for SQLite-based storage.
 impl MdkStorageProvider for MdkSqliteStorage {
-    type OpenMlsStorageProvider = MlsStorage;
-
     /// Returns the backend type.
     ///
     /// # Returns
@@ -503,29 +540,684 @@ impl MdkStorageProvider for MdkSqliteStorage {
     fn backend(&self) -> Backend {
         Backend::SQLite
     }
+}
 
-    /// Get a reference to the openmls storage provider.
-    ///
-    /// This method provides access to the underlying OpenMLS storage provider.
-    /// This is primarily useful for internal operations and testing.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the openmls storage implementation.
-    fn openmls_storage(&self) -> &Self::OpenMlsStorageProvider {
-        &self.openmls_storage
+// ============================================================================
+// OpenMLS StorageProvider<1> Implementation
+// ============================================================================
+
+impl StorageProvider<STORAGE_PROVIDER_VERSION> for MdkSqliteStorage {
+    type Error = MdkStorageError;
+
+    // ========================================================================
+    // Write Methods
+    // ========================================================================
+
+    fn write_mls_join_config<GroupId, MlsGroupJoinConfig>(
+        &self,
+        group_id: &GroupId,
+        config: &MlsGroupJoinConfig,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(conn, group_id, GroupDataType::JoinGroupConfig, config)
+        })
     }
 
-    /// Get a mutable reference to the openmls storage provider.
-    ///
-    /// This method provides mutable access to the underlying OpenMLS storage provider.
-    /// This is primarily useful for internal operations and testing.
-    ///
-    /// # Returns
-    ///
-    /// A mutable reference to the openmls storage implementation.
-    fn openmls_storage_mut(&mut self) -> &mut Self::OpenMlsStorageProvider {
-        &mut self.openmls_storage
+    fn append_own_leaf_node<GroupId, LeafNode>(
+        &self,
+        group_id: &GroupId,
+        leaf_node: &LeafNode,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::append_own_leaf_node(conn, group_id, leaf_node))
+    }
+
+    fn queue_proposal<GroupId, ProposalRef, QueuedProposal>(
+        &self,
+        group_id: &GroupId,
+        proposal_ref: &ProposalRef,
+        proposal: &QueuedProposal,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+        QueuedProposal: traits::QueuedProposal<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::queue_proposal(conn, group_id, proposal_ref, proposal)
+        })
+    }
+
+    fn write_tree<GroupId, TreeSync>(
+        &self,
+        group_id: &GroupId,
+        tree: &TreeSync,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(conn, group_id, GroupDataType::Tree, tree)
+        })
+    }
+
+    fn write_interim_transcript_hash<GroupId, InterimTranscriptHash>(
+        &self,
+        group_id: &GroupId,
+        interim_transcript_hash: &InterimTranscriptHash,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(
+                conn,
+                group_id,
+                GroupDataType::InterimTranscriptHash,
+                interim_transcript_hash,
+            )
+        })
+    }
+
+    fn write_context<GroupId, GroupContext>(
+        &self,
+        group_id: &GroupId,
+        group_context: &GroupContext,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(conn, group_id, GroupDataType::Context, group_context)
+        })
+    }
+
+    fn write_confirmation_tag<GroupId, ConfirmationTag>(
+        &self,
+        group_id: &GroupId,
+        confirmation_tag: &ConfirmationTag,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(
+                conn,
+                group_id,
+                GroupDataType::ConfirmationTag,
+                confirmation_tag,
+            )
+        })
+    }
+
+    fn write_group_state<GroupState, GroupId>(
+        &self,
+        group_id: &GroupId,
+        group_state: &GroupState,
+    ) -> Result<(), Self::Error>
+    where
+        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(conn, group_id, GroupDataType::GroupState, group_state)
+        })
+    }
+
+    fn write_message_secrets<GroupId, MessageSecrets>(
+        &self,
+        group_id: &GroupId,
+        message_secrets: &MessageSecrets,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(
+                conn,
+                group_id,
+                GroupDataType::MessageSecrets,
+                message_secrets,
+            )
+        })
+    }
+
+    fn write_resumption_psk_store<GroupId, ResumptionPskStore>(
+        &self,
+        group_id: &GroupId,
+        resumption_psk_store: &ResumptionPskStore,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(
+                conn,
+                group_id,
+                GroupDataType::ResumptionPskStore,
+                resumption_psk_store,
+            )
+        })
+    }
+
+    fn write_own_leaf_index<GroupId, LeafNodeIndex>(
+        &self,
+        group_id: &GroupId,
+        own_leaf_index: &LeafNodeIndex,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(
+                conn,
+                group_id,
+                GroupDataType::OwnLeafIndex,
+                own_leaf_index,
+            )
+        })
+    }
+
+    fn write_group_epoch_secrets<GroupId, GroupEpochSecrets>(
+        &self,
+        group_id: &GroupId,
+        group_epoch_secrets: &GroupEpochSecrets,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_group_data(
+                conn,
+                group_id,
+                GroupDataType::GroupEpochSecrets,
+                group_epoch_secrets,
+            )
+        })
+    }
+
+    fn write_signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
+        &self,
+        public_key: &SignaturePublicKey,
+        signature_key_pair: &SignatureKeyPair,
+    ) -> Result<(), Self::Error>
+    where
+        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
+        SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_signature_key_pair(conn, public_key, signature_key_pair)
+        })
+    }
+
+    fn write_encryption_key_pair<EncryptionKey, HpkeKeyPair>(
+        &self,
+        public_key: &EncryptionKey,
+        key_pair: &HpkeKeyPair,
+    ) -> Result<(), Self::Error>
+    where
+        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_encryption_key_pair(conn, public_key, key_pair)
+        })
+    }
+
+    fn write_encryption_epoch_key_pairs<GroupId, EpochKey, HpkeKeyPair>(
+        &self,
+        group_id: &GroupId,
+        epoch: &EpochKey,
+        leaf_index: u32,
+        key_pairs: &[HpkeKeyPair],
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::write_encryption_epoch_key_pairs(
+                conn, group_id, epoch, leaf_index, key_pairs,
+            )
+        })
+    }
+
+    fn write_key_package<HashReference, KeyPackage>(
+        &self,
+        hash_ref: &HashReference,
+        key_package: &KeyPackage,
+    ) -> Result<(), Self::Error>
+    where
+        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
+        KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::write_key_package(conn, hash_ref, key_package))
+    }
+
+    fn write_psk<PskId, PskBundle>(
+        &self,
+        psk_id: &PskId,
+        psk: &PskBundle,
+    ) -> Result<(), Self::Error>
+    where
+        PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
+        PskBundle: traits::PskBundle<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::write_psk(conn, psk_id, psk))
+    }
+
+    // ========================================================================
+    // Read Methods
+    // ========================================================================
+
+    fn mls_group_join_config<GroupId, MlsGroupJoinConfig>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<MlsGroupJoinConfig>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MlsGroupJoinConfig: traits::MlsGroupJoinConfig<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::JoinGroupConfig)
+        })
+    }
+
+    fn own_leaf_nodes<GroupId, LeafNode>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<LeafNode>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNode: traits::LeafNode<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::read_own_leaf_nodes(conn, group_id))
+    }
+
+    fn queued_proposal_refs<GroupId, ProposalRef>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<ProposalRef>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::read_queued_proposal_refs(conn, group_id))
+    }
+
+    fn queued_proposals<GroupId, ProposalRef, QueuedProposal>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<(ProposalRef, QueuedProposal)>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+        QueuedProposal: traits::QueuedProposal<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::read_queued_proposals(conn, group_id))
+    }
+
+    fn tree<GroupId, TreeSync>(&self, group_id: &GroupId) -> Result<Option<TreeSync>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        TreeSync: traits::TreeSync<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::Tree)
+        })
+    }
+
+    fn group_context<GroupId, GroupContext>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<GroupContext>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupContext: traits::GroupContext<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::Context)
+        })
+    }
+
+    fn interim_transcript_hash<GroupId, InterimTranscriptHash>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<InterimTranscriptHash>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        InterimTranscriptHash: traits::InterimTranscriptHash<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::InterimTranscriptHash)
+        })
+    }
+
+    fn confirmation_tag<GroupId, ConfirmationTag>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<ConfirmationTag>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ConfirmationTag: traits::ConfirmationTag<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::ConfirmationTag)
+        })
+    }
+
+    fn group_state<GroupState, GroupId>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<GroupState>, Self::Error>
+    where
+        GroupState: traits::GroupState<STORAGE_PROVIDER_VERSION>,
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::GroupState)
+        })
+    }
+
+    fn message_secrets<GroupId, MessageSecrets>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<MessageSecrets>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        MessageSecrets: traits::MessageSecrets<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::MessageSecrets)
+        })
+    }
+
+    fn resumption_psk_store<GroupId, ResumptionPskStore>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<ResumptionPskStore>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ResumptionPskStore: traits::ResumptionPskStore<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::ResumptionPskStore)
+        })
+    }
+
+    fn own_leaf_index<GroupId, LeafNodeIndex>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<LeafNodeIndex>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        LeafNodeIndex: traits::LeafNodeIndex<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::OwnLeafIndex)
+        })
+    }
+
+    fn group_epoch_secrets<GroupId, GroupEpochSecrets>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<GroupEpochSecrets>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        GroupEpochSecrets: traits::GroupEpochSecrets<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_group_data(conn, group_id, GroupDataType::GroupEpochSecrets)
+        })
+    }
+
+    fn signature_key_pair<SignaturePublicKey, SignatureKeyPair>(
+        &self,
+        public_key: &SignaturePublicKey,
+    ) -> Result<Option<SignatureKeyPair>, Self::Error>
+    where
+        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
+        SignatureKeyPair: traits::SignatureKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::read_signature_key_pair(conn, public_key))
+    }
+
+    fn encryption_key_pair<HpkeKeyPair, EncryptionKey>(
+        &self,
+        public_key: &EncryptionKey,
+    ) -> Result<Option<HpkeKeyPair>, Self::Error>
+    where
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::read_encryption_key_pair(conn, public_key))
+    }
+
+    fn encryption_epoch_key_pairs<GroupId, EpochKey, HpkeKeyPair>(
+        &self,
+        group_id: &GroupId,
+        epoch: &EpochKey,
+        leaf_index: u32,
+    ) -> Result<Vec<HpkeKeyPair>, Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
+        HpkeKeyPair: traits::HpkeKeyPair<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::read_encryption_epoch_key_pairs(conn, group_id, epoch, leaf_index)
+        })
+    }
+
+    fn key_package<HashReference, KeyPackage>(
+        &self,
+        hash_ref: &HashReference,
+    ) -> Result<Option<KeyPackage>, Self::Error>
+    where
+        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
+        KeyPackage: traits::KeyPackage<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::read_key_package(conn, hash_ref))
+    }
+
+    fn psk<PskBundle, PskId>(&self, psk_id: &PskId) -> Result<Option<PskBundle>, Self::Error>
+    where
+        PskBundle: traits::PskBundle<STORAGE_PROVIDER_VERSION>,
+        PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::read_psk(conn, psk_id))
+    }
+
+    // ========================================================================
+    // Delete Methods
+    // ========================================================================
+
+    fn remove_proposal<GroupId, ProposalRef>(
+        &self,
+        group_id: &GroupId,
+        proposal_ref: &ProposalRef,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::remove_proposal(conn, group_id, proposal_ref))
+    }
+
+    fn delete_own_leaf_nodes<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::delete_own_leaf_nodes(conn, group_id))
+    }
+
+    fn delete_group_config<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::JoinGroupConfig)
+        })
+    }
+
+    fn delete_tree<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::Tree)
+        })
+    }
+
+    fn delete_confirmation_tag<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::ConfirmationTag)
+        })
+    }
+
+    fn delete_group_state<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::GroupState)
+        })
+    }
+
+    fn delete_context<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::Context)
+        })
+    }
+
+    fn delete_interim_transcript_hash<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::InterimTranscriptHash)
+        })
+    }
+
+    fn delete_message_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::MessageSecrets)
+        })
+    }
+
+    fn delete_all_resumption_psk_secrets<GroupId>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::ResumptionPskStore)
+        })
+    }
+
+    fn delete_own_leaf_index<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::OwnLeafIndex)
+        })
+    }
+
+    fn delete_group_epoch_secrets<GroupId>(&self, group_id: &GroupId) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_group_data(conn, group_id, GroupDataType::GroupEpochSecrets)
+        })
+    }
+
+    fn clear_proposal_queue<GroupId, ProposalRef>(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        ProposalRef: traits::ProposalRef<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::clear_proposal_queue(conn, group_id))
+    }
+
+    fn delete_signature_key_pair<SignaturePublicKey>(
+        &self,
+        public_key: &SignaturePublicKey,
+    ) -> Result<(), Self::Error>
+    where
+        SignaturePublicKey: traits::SignaturePublicKey<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::delete_signature_key_pair(conn, public_key))
+    }
+
+    fn delete_encryption_key_pair<EncryptionKey>(
+        &self,
+        public_key: &EncryptionKey,
+    ) -> Result<(), Self::Error>
+    where
+        EncryptionKey: traits::EncryptionKey<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::delete_encryption_key_pair(conn, public_key))
+    }
+
+    fn delete_encryption_epoch_key_pairs<GroupId, EpochKey>(
+        &self,
+        group_id: &GroupId,
+        epoch: &EpochKey,
+        leaf_index: u32,
+    ) -> Result<(), Self::Error>
+    where
+        GroupId: traits::GroupId<STORAGE_PROVIDER_VERSION>,
+        EpochKey: traits::EpochKey<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| {
+            mls_storage::delete_encryption_epoch_key_pairs(conn, group_id, epoch, leaf_index)
+        })
+    }
+
+    fn delete_key_package<HashReference>(&self, hash_ref: &HashReference) -> Result<(), Self::Error>
+    where
+        HashReference: traits::HashReference<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::delete_key_package(conn, hash_ref))
+    }
+
+    fn delete_psk<PskId>(&self, psk_id: &PskId) -> Result<(), Self::Error>
+    where
+        PskId: traits::PskId<STORAGE_PROVIDER_VERSION>,
+    {
+        self.with_connection(|conn| mls_storage::delete_psk(conn, psk_id))
     }
 }
 
@@ -579,18 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn test_openmls_storage_access() {
-        let storage = MdkSqliteStorage::new_in_memory().unwrap();
-
-        // Test that we can get a reference to the openmls storage
-        let _openmls_storage = storage.openmls_storage();
-
-        // Test mutable accessor
-        let mut mutable_storage = MdkSqliteStorage::new_in_memory().unwrap();
-        let _mutable_ref = mutable_storage.openmls_storage_mut();
-    }
-
-    #[test]
     fn test_database_tables() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("migration_test.sqlite");
@@ -599,11 +1279,9 @@ mod tests {
         let storage = MdkSqliteStorage::new_unencrypted(&db_path).unwrap();
 
         // Verify the database has been properly initialized with migrations
-        {
-            let conn_guard = storage.db_connection.lock().unwrap();
-
+        storage.with_connection(|conn| {
             // Check if the tables exist
-            let mut stmt = conn_guard
+            let mut stmt = conn
                 .prepare("SELECT name FROM sqlite_master WHERE type='table'")
                 .unwrap();
             let table_names: Vec<String> = stmt
@@ -612,7 +1290,7 @@ mod tests {
                 .map(|r| r.unwrap())
                 .collect();
 
-            // Check for essential tables
+            // Check for MDK tables
             assert!(table_names.contains(&"groups".to_string()));
             assert!(table_names.contains(&"messages".to_string()));
             assert!(table_names.contains(&"welcomes".to_string()));
@@ -620,7 +1298,17 @@ mod tests {
             assert!(table_names.contains(&"processed_welcomes".to_string()));
             assert!(table_names.contains(&"group_relays".to_string()));
             assert!(table_names.contains(&"group_exporter_secrets".to_string()));
-        } // conn_guard is dropped here when it goes out of scope
+
+            // Check for OpenMLS tables
+            assert!(table_names.contains(&"openmls_group_data".to_string()));
+            assert!(table_names.contains(&"openmls_proposals".to_string()));
+            assert!(table_names.contains(&"openmls_own_leaf_nodes".to_string()));
+            assert!(table_names.contains(&"openmls_key_packages".to_string()));
+            assert!(table_names.contains(&"openmls_psks".to_string()));
+            assert!(table_names.contains(&"openmls_signature_keys".to_string()));
+            assert!(table_names.contains(&"openmls_encryption_keys".to_string()));
+            assert!(table_names.contains(&"openmls_epoch_key_pairs".to_string()));
+        });
 
         // Drop explicitly to release all resources
         drop(storage);
@@ -1664,6 +2352,621 @@ mod tests {
             let wrong_config = EncryptionConfig::new(key1);
             let result = MdkSqliteStorage::new_with_key(&db2_path, wrong_config);
             assert!(result.is_err());
+        }
+    }
+
+    // ========================================
+    // Transaction/Savepoint Tests (Phase 5)
+    // ========================================
+
+    mod savepoint_tests {
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::test_utils::cross_storage::create_test_group;
+
+        use super::*;
+
+        #[test]
+        fn test_savepoint_creation_succeeds() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create a savepoint
+            let result = storage.savepoint("test_sp");
+            assert!(result.is_ok());
+
+            // Clean up by releasing
+            let result = storage.release_savepoint("test_sp");
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_rollback_to_savepoint_restores_state() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save initial group
+            let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Original Name".to_string();
+            group.epoch = 1;
+            storage.save_group(group.clone()).unwrap();
+
+            // Verify initial state
+            let initial_group = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(initial_group.name, "Original Name");
+            assert_eq!(initial_group.epoch, 1);
+
+            // Create a savepoint
+            storage.savepoint("before_modification").unwrap();
+
+            // Modify the group
+            let mut modified_group = group.clone();
+            modified_group.name = "Modified Name".to_string();
+            modified_group.epoch = 5;
+            storage.save_group(modified_group).unwrap();
+
+            // Verify modification
+            let after_mod = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_mod.name, "Modified Name");
+            assert_eq!(after_mod.epoch, 5);
+
+            // Rollback to savepoint
+            storage
+                .rollback_to_savepoint("before_modification")
+                .unwrap();
+
+            // Verify original state is restored
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Original Name");
+            assert_eq!(after_rollback.epoch, 1);
+
+            // Release the savepoint
+            storage.release_savepoint("before_modification").unwrap();
+        }
+
+        #[test]
+        fn test_release_savepoint_commits_changes() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create initial group
+            let mls_group_id = GroupId::from_slice(&[5, 6, 7, 8]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Initial".to_string();
+            storage.save_group(group.clone()).unwrap();
+
+            // Create savepoint
+            storage.savepoint("commit_test").unwrap();
+
+            // Modify the group
+            let mut modified = group.clone();
+            modified.name = "Committed Changes".to_string();
+            storage.save_group(modified).unwrap();
+
+            // Release savepoint (commit changes)
+            storage.release_savepoint("commit_test").unwrap();
+
+            // Verify changes are still there after release
+            let result = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.name, "Committed Changes");
+        }
+
+        #[test]
+        fn test_nested_savepoints() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create a group
+            let mls_group_id = GroupId::from_slice(&[9, 10, 11, 12]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Level 0".to_string();
+            storage.save_group(group.clone()).unwrap();
+
+            // First savepoint
+            storage.savepoint("level1").unwrap();
+
+            // Modify to level 1
+            let mut level1_group = group.clone();
+            level1_group.name = "Level 1".to_string();
+            storage.save_group(level1_group.clone()).unwrap();
+
+            // Second nested savepoint
+            storage.savepoint("level2").unwrap();
+
+            // Modify to level 2
+            let mut level2_group = level1_group.clone();
+            level2_group.name = "Level 2".to_string();
+            storage.save_group(level2_group).unwrap();
+
+            // Verify we're at level 2
+            let current = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.name, "Level 2");
+
+            // Rollback to level 2 savepoint (back to level 1)
+            storage.rollback_to_savepoint("level2").unwrap();
+
+            // Verify we're at level 1
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Level 1");
+
+            // Release level 2 savepoint
+            storage.release_savepoint("level2").unwrap();
+
+            // Rollback to level 1 savepoint (back to level 0)
+            storage.rollback_to_savepoint("level1").unwrap();
+
+            // Verify we're at level 0
+            let final_state = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(final_state.name, "Level 0");
+
+            // Clean up
+            storage.release_savepoint("level1").unwrap();
+        }
+
+        #[test]
+        fn test_savepoint_with_new_group_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Verify group doesn't exist
+            let mls_group_id = GroupId::from_slice(&[13, 14, 15, 16]);
+            let before = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(before.is_none());
+
+            // Create savepoint
+            storage.savepoint("before_insert").unwrap();
+
+            // Insert a new group
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Verify group exists
+            let after_insert = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(after_insert.is_some());
+
+            // Rollback
+            storage.rollback_to_savepoint("before_insert").unwrap();
+
+            // Verify group no longer exists
+            let after_rollback = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(after_rollback.is_none());
+
+            // Clean up
+            storage.release_savepoint("before_insert").unwrap();
+        }
+
+        #[test]
+        fn test_savepoint_with_multiple_modifications_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create and save a group
+            let mls_group_id = GroupId::from_slice(&[17, 18, 19, 20]);
+            let mut group = create_test_group(mls_group_id.clone());
+            group.name = "Original".to_string();
+            group.epoch = 1;
+            storage.save_group(group.clone()).unwrap();
+
+            // Verify group exists with original values
+            let exists = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(exists.name, "Original");
+            assert_eq!(exists.epoch, 1);
+
+            // Create savepoint
+            storage.savepoint("before_modifications").unwrap();
+
+            // Make multiple modifications
+            let mut modified1 = group.clone();
+            modified1.name = "Modified Once".to_string();
+            modified1.epoch = 10;
+            storage.save_group(modified1).unwrap();
+
+            let mut modified2 = group.clone();
+            modified2.name = "Modified Twice".to_string();
+            modified2.epoch = 20;
+            storage.save_group(modified2).unwrap();
+
+            // Verify final modification
+            let after_mods = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_mods.name, "Modified Twice");
+            assert_eq!(after_mods.epoch, 20);
+
+            // Rollback
+            storage
+                .rollback_to_savepoint("before_modifications")
+                .unwrap();
+
+            // Verify original values are restored
+            let after_rollback = storage
+                .find_group_by_mls_group_id(&mls_group_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_rollback.name, "Original");
+            assert_eq!(after_rollback.epoch, 1);
+
+            // Clean up
+            storage.release_savepoint("before_modifications").unwrap();
+        }
+    }
+
+    // ========================================
+    // Migration Tests (Phase 5)
+    // ========================================
+
+    mod migration_tests {
+        use super::*;
+
+        #[test]
+        fn test_fresh_database_has_all_tables() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Expected MDK tables
+            let expected_mdk_tables = [
+                "groups",
+                "group_relays",
+                "group_exporter_secrets",
+                "messages",
+                "processed_messages",
+                "welcomes",
+                "processed_welcomes",
+            ];
+
+            // Expected OpenMLS tables
+            let expected_openmls_tables = [
+                "openmls_group_data",
+                "openmls_proposals",
+                "openmls_own_leaf_nodes",
+                "openmls_key_packages",
+                "openmls_psks",
+                "openmls_signature_keys",
+                "openmls_encryption_keys",
+                "openmls_epoch_key_pairs",
+            ];
+
+            storage.with_connection(|conn| {
+                // Get all table names
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                    )
+                    .unwrap();
+                let table_names: Vec<String> = stmt
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                // Check MDK tables
+                for table in &expected_mdk_tables {
+                    assert!(
+                        table_names.contains(&table.to_string()),
+                        "Missing MDK table: {}",
+                        table
+                    );
+                }
+
+                // Check OpenMLS tables
+                for table in &expected_openmls_tables {
+                    assert!(
+                        table_names.contains(&table.to_string()),
+                        "Missing OpenMLS table: {}",
+                        table
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn test_all_indexes_exist() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Expected indexes (actual names from schema)
+            let expected_indexes = [
+                "idx_groups_nostr_group_id",
+                "idx_group_relays_mls_group_id",
+                "idx_group_exporter_secrets_mls_group_id",
+                "idx_messages_mls_group_id",
+                "idx_messages_wrapper_event_id",
+                "idx_messages_created_at",
+                "idx_messages_pubkey",
+                "idx_messages_kind",
+                "idx_messages_state",
+                "idx_processed_messages_message_event_id",
+                "idx_processed_messages_state",
+                "idx_processed_messages_processed_at",
+                "idx_welcomes_mls_group_id",
+                "idx_welcomes_wrapper_event_id",
+                "idx_welcomes_state",
+                "idx_welcomes_nostr_group_id",
+                "idx_processed_welcomes_welcome_event_id",
+                "idx_processed_welcomes_state",
+                "idx_processed_welcomes_processed_at",
+            ];
+
+            storage.with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")
+                    .unwrap();
+                let index_names: Vec<String> = stmt
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                for idx in &expected_indexes {
+                    assert!(
+                        index_names.contains(&idx.to_string()),
+                        "Missing index: {}. Found indexes: {:?}",
+                        idx,
+                        index_names
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn test_foreign_key_constraints_work() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            storage.with_connection(|conn| {
+                // Verify foreign keys are enabled
+                let fk_enabled: i32 = conn
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(fk_enabled, 1, "Foreign keys should be enabled");
+
+                // Try to insert a group_relay without a group (should fail)
+                let result = conn.execute(
+                    "INSERT INTO group_relays (mls_group_id, relay_url) VALUES (?, ?)",
+                    rusqlite::params![vec![1u8, 2u8, 3u8, 4u8], "wss://relay.example.com"],
+                );
+                assert!(result.is_err(), "Should fail due to foreign key constraint");
+            });
+        }
+
+        #[test]
+        fn test_openmls_group_data_check_constraint() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            storage.with_connection(|conn| {
+                // Valid data_type should succeed
+                let valid_result = conn.execute(
+                    "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![1, vec![1u8, 2u8, 3u8], "tree", vec![4u8, 5u8, 6u8]],
+                );
+                assert!(valid_result.is_ok(), "Valid data_type should succeed");
+
+                // Invalid data_type should fail
+                let invalid_result = conn.execute(
+                    "INSERT INTO openmls_group_data (provider_version, group_id, data_type, group_data) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![1, vec![7u8, 8u8, 9u8], "invalid_type", vec![10u8, 11u8]],
+                );
+                assert!(
+                    invalid_result.is_err(),
+                    "Invalid data_type should fail CHECK constraint"
+                );
+            });
+        }
+
+        #[test]
+        fn test_schema_matches_plan_specification() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            storage.with_connection(|conn| {
+                // Check groups table has all required columns
+                let groups_info: Vec<(String, String)> = conn
+                    .prepare("PRAGMA table_info(groups)")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                let groups_columns: Vec<&str> =
+                    groups_info.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(groups_columns.contains(&"mls_group_id"));
+                assert!(groups_columns.contains(&"nostr_group_id"));
+                assert!(groups_columns.contains(&"name"));
+                assert!(groups_columns.contains(&"description"));
+                assert!(groups_columns.contains(&"admin_pubkeys"));
+                assert!(groups_columns.contains(&"epoch"));
+                assert!(groups_columns.contains(&"state"));
+
+                // Check messages table has all required columns
+                let messages_info: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")
+                    .unwrap()
+                    .query_map([], |row| row.get(1))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+
+                assert!(messages_info.contains(&"mls_group_id".to_string()));
+                assert!(messages_info.contains(&"id".to_string()));
+                assert!(messages_info.contains(&"pubkey".to_string()));
+                assert!(messages_info.contains(&"kind".to_string()));
+                assert!(messages_info.contains(&"created_at".to_string()));
+                assert!(messages_info.contains(&"content".to_string()));
+                assert!(messages_info.contains(&"wrapper_event_id".to_string()));
+            });
+        }
+    }
+
+    // ========================================
+    // Cross-Storage Atomicity Tests (Phase 5)
+    // ========================================
+
+    mod atomicity_tests {
+        use mdk_storage_traits::groups::GroupStorage;
+        use mdk_storage_traits::messages::MessageStorage;
+        use mdk_storage_traits::test_utils::cross_storage::{
+            create_test_group, create_test_message,
+        };
+        use nostr::EventId;
+
+        use super::*;
+
+        #[test]
+        fn test_mdk_operations_in_single_transaction_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create a group first
+            let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Create savepoint
+            storage.savepoint("mdk_atomic").unwrap();
+
+            // Save a message
+            let event_id = EventId::all_zeros();
+            let message = create_test_message(mls_group_id.clone(), event_id);
+            storage.save_message(message).unwrap();
+
+            // Verify message exists
+            let messages = storage.messages(&mls_group_id, None).unwrap();
+            assert_eq!(messages.len(), 1);
+
+            // Rollback
+            storage.rollback_to_savepoint("mdk_atomic").unwrap();
+
+            // Verify message is gone
+            let messages_after = storage.messages(&mls_group_id, None).unwrap();
+            assert_eq!(messages_after.len(), 0);
+
+            // Release savepoint
+            storage.release_savepoint("mdk_atomic").unwrap();
+        }
+
+        #[test]
+        fn test_group_atomic_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create savepoint before anything
+            storage.savepoint("atomic_group").unwrap();
+
+            // Create group
+            let mls_group_id = GroupId::from_slice(&[5, 6, 7, 8]);
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Verify group exists
+            let found_group = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(found_group.is_some());
+
+            // Rollback
+            storage.rollback_to_savepoint("atomic_group").unwrap();
+
+            // Verify group is gone
+            let after_group = storage.find_group_by_mls_group_id(&mls_group_id).unwrap();
+            assert!(after_group.is_none());
+
+            // Release savepoint
+            storage.release_savepoint("atomic_group").unwrap();
+        }
+
+        #[test]
+        fn test_exporter_secrets_atomic_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create group first
+            let mls_group_id = GroupId::from_slice(&[6, 7, 8, 9]);
+            let group = create_test_group(mls_group_id.clone());
+            storage.save_group(group).unwrap();
+
+            // Create savepoint
+            storage.savepoint("atomic_secrets").unwrap();
+
+            // Add exporter secrets
+            let secret = mdk_storage_traits::groups::types::GroupExporterSecret {
+                mls_group_id: mls_group_id.clone(),
+                epoch: 1,
+                secret: mdk_storage_traits::Secret::new([1u8; 32]),
+            };
+            storage.save_group_exporter_secret(secret.clone()).unwrap();
+
+            // Verify secret exists
+            let found = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
+            assert!(found.is_some());
+
+            // Rollback
+            storage.rollback_to_savepoint("atomic_secrets").unwrap();
+
+            // Verify secret is gone
+            let after = storage.get_group_exporter_secret(&mls_group_id, 1).unwrap();
+            assert!(after.is_none());
+
+            // Release savepoint
+            storage.release_savepoint("atomic_secrets").unwrap();
+        }
+
+        #[test]
+        fn test_partial_failure_rollback() {
+            let storage = MdkSqliteStorage::new_in_memory().unwrap();
+
+            // Create two groups
+            let group_id_1 = GroupId::from_slice(&[1, 1, 1, 1]);
+            let group_id_2 = GroupId::from_slice(&[2, 2, 2, 2]);
+
+            let group1 = create_test_group(group_id_1.clone());
+            storage.save_group(group1).unwrap();
+
+            // Create savepoint
+            storage.savepoint("partial_test").unwrap();
+
+            // Save second group
+            let group2 = create_test_group(group_id_2.clone());
+            storage.save_group(group2).unwrap();
+
+            // Add message to first group
+            let event_id = EventId::all_zeros();
+            let message = create_test_message(group_id_1.clone(), event_id);
+            storage.save_message(message).unwrap();
+
+            // Verify both changes
+            let groups = storage.all_groups().unwrap();
+            assert_eq!(groups.len(), 2);
+            let messages = storage.messages(&group_id_1, None).unwrap();
+            assert_eq!(messages.len(), 1);
+
+            // Rollback - simulating a failure after partial operations
+            storage.rollback_to_savepoint("partial_test").unwrap();
+
+            // Verify only first group remains, no new group, no messages
+            let groups_after = storage.all_groups().unwrap();
+            assert_eq!(groups_after.len(), 1);
+            assert!(
+                storage
+                    .find_group_by_mls_group_id(&group_id_2)
+                    .unwrap()
+                    .is_none()
+            );
+            let messages_after = storage.messages(&group_id_1, None).unwrap();
+            assert_eq!(messages_after.len(), 0);
+
+            // Release savepoint
+            storage.release_savepoint("partial_test").unwrap();
         }
     }
 }

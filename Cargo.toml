@@ -23,8 +23,6 @@ openmls = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e18
 openmls_traits = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
 openmls_basic_credential = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
 openmls_rust_crypto = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
-openmls_memory_storage = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
-openmls_sqlite_storage = { git = "https://github.com/openmls/openmls", rev = "b90ca23b1238d9e189142d06234527b2d344d748", default-features = false }
 
 # Nostr
 nostr = { version = "0.43", default-features = false }

@@ -106,15 +106,15 @@ impl WelcomeStorage for MdkMemoryStorage {
 mod tests {
     use std::collections::BTreeSet;
 
+    use mdk_storage_traits::GroupId;
+    use mdk_storage_traits::test_utils::cross_storage::create_test_welcome;
+    use nostr::{EventId, Keys, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
+
     use super::*;
     use crate::{
         DEFAULT_MAX_ADMINS_PER_WELCOME, DEFAULT_MAX_RELAY_URL_LENGTH,
         DEFAULT_MAX_RELAYS_PER_WELCOME,
     };
-    use mdk_storage_traits::GroupId;
-    use mdk_storage_traits::test_utils::cross_storage::create_test_welcome;
-    use nostr::{EventId, Keys, Kind, PublicKey, RelayUrl, Tags, Timestamp, UnsignedEvent};
-    use openmls_memory_storage::MemoryStorage;
 
     fn create_welcome_with_relays(
         mls_group_id: GroupId,
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_save_welcome_relay_count_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         // Test with relay count at exactly the limit (should succeed)
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_save_welcome_relay_url_length_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
         let event_id = EventId::from_hex(&format!("{:064x}", 1)).unwrap();
 
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_save_welcome_admin_count_validation() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
         // Test with admin count at exactly the limit (should succeed)
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_pending_welcomes_pagination_memory() {
-        let storage = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage = MdkMemoryStorage::new();
 
         let mls_group_id = GroupId::from_slice(&[1, 2, 3, 4]);
 
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(result.unwrap().len(), 0); // No results at that offset
 
         // Test 11: Empty results when no pending entries
-        let storage2 = MdkMemoryStorage::new(MemoryStorage::default());
+        let storage2 = MdkMemoryStorage::new();
         let empty = storage2
             .pending_welcomes(Some(Pagination::new(Some(10), Some(0))))
             .unwrap();
@@ -398,7 +398,7 @@ mod tests {
             .with_max_admins_per_welcome(3)
             .with_max_relay_url_length(50);
 
-        let storage = MdkMemoryStorage::with_limits(MemoryStorage::default(), limits);
+        let storage = MdkMemoryStorage::with_limits(limits);
 
         // Verify limits are accessible
         assert_eq!(storage.limits().max_relays_per_welcome, 2);
