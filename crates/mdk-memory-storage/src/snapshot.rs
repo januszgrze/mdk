@@ -17,6 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use lru::LruCache;
 use mdk_storage_traits::GroupId;
+use serde::{Deserialize, Serialize};
 use mdk_storage_traits::groups::types::{Group, GroupExporterSecret, GroupRelay};
 use mdk_storage_traits::messages::types::{Message, ProcessedMessage};
 use mdk_storage_traits::welcomes::types::{ProcessedWelcome, Welcome};
@@ -52,7 +53,7 @@ use crate::mls_storage::GroupDataType;
 /// - MLS encryption keys (identity-scoped, not group-scoped)
 /// - Messages (handled separately via `invalidate_messages_after_epoch`)
 /// - Welcomes (keyed by EventId, not group-scoped)
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GroupScopedSnapshot {
     /// The group ID this snapshot is for
     pub(crate) group_id: GroupId,
@@ -110,7 +111,7 @@ pub struct GroupScopedSnapshot {
 /// // If we need to undo (ensure no concurrent operations):
 /// storage.restore_snapshot(snapshot);
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryStorageSnapshot {
     // MLS data
     pub(crate) mls_group_data: HashMap<(Vec<u8>, GroupDataType), Vec<u8>>,

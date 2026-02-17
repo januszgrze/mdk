@@ -3,7 +3,7 @@
 //! This module provides shared codec and type definitions used by both
 //! memory and SQLite storage implementations for OpenMLS data.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 
 use crate::MdkStorageError;
@@ -16,7 +16,7 @@ pub const STORAGE_PROVIDER_VERSION: u16 = 1;
 /// This enum represents the different types of MLS group data that can be stored.
 /// Both in-memory and SQLite storage implementations use this to distinguish
 /// between different data types associated with a group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GroupDataType {
     /// MLS group join configuration
     JoinGroupConfig,
