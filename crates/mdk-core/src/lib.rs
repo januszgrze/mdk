@@ -225,10 +225,7 @@ where
     pub fn build(self) -> MDK<Storage> {
         // Prune expired snapshots on startup for persistent backends
         if self.storage.backend().is_persistent() {
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("System time before Unix epoch")
-                .as_secs();
+            let current_time = nostr::Timestamp::now().as_secs();
             let min_timestamp = current_time.saturating_sub(self.config.snapshot_ttl_seconds);
             if let Ok(pruned_count) = self.storage.prune_expired_snapshots(min_timestamp)
                 && pruned_count > 0

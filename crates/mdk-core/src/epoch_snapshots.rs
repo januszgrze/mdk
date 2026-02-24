@@ -12,10 +12,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
-use std::time::Instant;
 
 use mdk_storage_traits::{GroupId, MdkStorageError, MdkStorageProvider};
-use nostr::EventId;
+use nostr::{EventId, Timestamp};
 
 use crate::Error;
 
@@ -31,8 +30,8 @@ pub struct EpochSnapshot {
     pub applied_commit_id: EventId,
     /// The timestamp of the applied commit (for MIP-03 comparison)
     pub applied_commit_ts: u64,
-    /// When the snapshot was created
-    pub created_at: Instant,
+    /// When the snapshot was created (Unix timestamp)
+    pub created_at: u64,
     /// The unique name of the snapshot in storage
     pub snapshot_name: String,
 }
@@ -179,7 +178,7 @@ impl EpochSnapshotManager {
             epoch,
             applied_commit_id: commit_id,
             applied_commit_ts: 0, // Unknown after restart - hydrated snapshots should not be used for is_better_candidate
-            created_at: Instant::now(), // Placeholder - not used for comparisons
+            created_at: Timestamp::now().as_secs(), // Placeholder - not used for comparisons
             snapshot_name: snapshot_name.to_string(),
         })
     }
@@ -215,7 +214,7 @@ impl EpochSnapshotManager {
             epoch: current_epoch,
             applied_commit_id: *commit_id,
             applied_commit_ts: commit_ts,
-            created_at: Instant::now(),
+            created_at: Timestamp::now().as_secs(),
             snapshot_name: snapshot_name.clone(),
         };
 
@@ -379,7 +378,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000, // Applied at timestamp 1000
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "test_snap".to_string(),
             };
             inner
@@ -410,7 +409,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "test_snap".to_string(),
             };
             inner
@@ -442,7 +441,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "test_snap".to_string(),
             };
             inner
@@ -474,7 +473,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "test_snap".to_string(),
             };
             inner
@@ -505,7 +504,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "test_snap".to_string(),
             };
             inner
@@ -534,7 +533,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "test_snap".to_string(),
             };
             inner
@@ -606,7 +605,7 @@ mod tests {
                 epoch: 10,
                 applied_commit_id: applied_id,
                 applied_commit_ts: 1000,
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "test_snap".to_string(),
             };
             inner
@@ -738,7 +737,7 @@ mod tests {
             epoch: 10,
             applied_commit_id: event_id,
             applied_commit_ts: 1000,
-            created_at: Instant::now(),
+            created_at: Timestamp::now().as_secs(),
             snapshot_name: "snap_abc123".to_string(),
         };
 
@@ -782,7 +781,7 @@ mod tests {
                     epoch,
                     applied_commit_id: event_id,
                     applied_commit_ts: 1000,
-                    created_at: Instant::now(),
+                    created_at: Timestamp::now().as_secs(),
                     snapshot_name: format!("snap_{}", epoch),
                 };
                 inner
@@ -798,7 +797,7 @@ mod tests {
                 epoch: 0,
                 applied_commit_id: event_id,
                 applied_commit_ts: 1000,
-                created_at: Instant::now(),
+                created_at: Timestamp::now().as_secs(),
                 snapshot_name: "snap_0".to_string(),
             };
             inner

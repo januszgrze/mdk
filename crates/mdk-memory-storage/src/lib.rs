@@ -632,11 +632,7 @@ impl MdkMemoryStorage {
             .map(|((_, epoch), secret)| (*epoch, secret.clone()))
             .collect();
 
-        // Get current Unix timestamp
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("System time before Unix epoch")
-            .as_secs();
+        let created_at = nostr::Timestamp::now().as_secs();
 
         GroupScopedSnapshot {
             group_id: group_id.clone(),
